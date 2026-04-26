@@ -125,14 +125,13 @@ fun ExceptionsTab() {
         Spacer(modifier = Modifier.height(14.dp))
 
         // Mode Toggle
-        Card(
-            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        AppSectionCard(
+            modifier = Modifier.padding(bottom = 12.dp),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
@@ -141,7 +140,8 @@ fun ExceptionsTab() {
                         "Режим исключений",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.Medium,
-                        fontSize = 14.sp
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                         if (isWhitelist) "БС: Неотмеченные приложения добавляются в туннель"
@@ -255,6 +255,7 @@ fun AppRow(app: AppItem, isSelected: Boolean, onClick: () -> Unit) {
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = if (isSelected) 4.dp else 0.dp
     ) {
         Row(
@@ -278,6 +279,7 @@ fun AppRow(app: AppItem, isSelected: Boolean, onClick: () -> Unit) {
                     text = app.name,
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1
                 )
                 Text(

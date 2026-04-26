@@ -73,7 +73,7 @@ fun LogsTab() {
             modifier = Modifier.fillMaxSize(),
             colors = CardDefaults.cardColors(containerColor = terminalBg),
             shape = RoundedCornerShape(20.dp),
-            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+            elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
         ) {
             LazyColumn(
                 state = listState,

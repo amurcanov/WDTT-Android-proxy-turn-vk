@@ -9,13 +9,15 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.PowerSettingsNew
@@ -26,6 +28,9 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -45,9 +50,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import android.content.Intent
+import android.net.VpnService
 import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import kotlin.math.roundToInt
 
 private const val WORKERS_PER_GROUP = 12
+private const val RJS_TEMPORARILY_DISABLED = true
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -68,6 +79,10 @@ fun SettingsTab() {
 @Composable
 fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutines.CoroutineScope, settingsStore: SettingsStore) {
     val savedConnectionPassword by settingsStore.connectionPassword.collectAsStateWithLifecycle(initialValue = "")
+    val savedManualPortsEnabled by settingsStore.manualPortsEnabled.collectAsStateWithLifecycle(initialValue = false)
+    val savedServerDtlsPort by settingsStore.serverDtlsPort.collectAsStateWithLifecycle(initialValue = 56000)
+    val savedServerWgPort by settingsStore.serverWgPort.collectAsStateWithLifecycle(initialValue = 56001)
+    val savedListenPort by settingsStore.listenPort.collectAsStateWithLifecycle(initialValue = 9000)
 
     val tunnelRunning by TunnelManager.running.collectAsStateWithLifecycle()
 
@@ -90,6 +105,10 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
     var showHashesDialog by rememberSaveable { mutableStateOf(false) }
     var useWVCaptcha by rememberSaveable { mutableStateOf(false) }
     var isManualMode by rememberSaveable { mutableStateOf(true) }
+    var wbvManualMode by rememberSaveable { mutableStateOf(true) }
+    var manualPortsEnabled by rememberSaveable { mutableStateOf(false) }
+    var serverDtlsPortInput by rememberSaveable { mutableStateOf("56000") }
+    var serverWgPortInput by rememberSaveable { mutableStateOf("56001") }
 
     val allHashes = remember(vkHash1, vkHash2, vkHash3) { listOf(vkHash1, vkHash2, vkHash3) }
     val uniqueHashes = remember(vkHash1, vkHash2, vkHash3) { allHashes.filter { it.isNotBlank() && it.length >= 16 }.distinct() }
@@ -119,8 +138,6 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
     val hasInputHashErrors = remember(vkHash1, vkHash2, vkHash3) { hashErrors.isNotEmpty() }
 
     var showSecretsDialog by rememberSaveable { mutableStateOf(false) }
-    var showImportantInfoDialog by rememberSaveable { mutableStateOf(false) }
-
     var initialized by remember { mutableStateOf(false) }
 
     fun parseHashes(raw: String) {
@@ -136,20 +153,50 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
         val workers = settingsStore.workersPerHash.first()
         val protocol = settingsStore.protocol.first()
         val port = settingsStore.listenPort.first()
+        val manualPorts = settingsStore.manualPortsEnabled.first()
+        val serverDtlsPort = settingsStore.serverDtlsPort.first()
+        val serverWgPort = settingsStore.serverWgPort.first()
         val sni = settingsStore.sni.first()
         val captchaMode = settingsStore.captchaMode.first()
         val captchaMethod = settingsStore.captchaSolveMethod.first()
+        val wbvCaptchaMethod = settingsStore.captchaWbvSolveMethod.first()
+        val effectiveCaptchaMode = if (RJS_TEMPORARILY_DISABLED && captchaMode == "rjs") "wv" else captchaMode
         
         peerInput = peer
         parseHashes(hashes)
         workersInput = roundToGroup(workers.toFloat(), (listOf(vkHash1, vkHash2, vkHash3).count { it.isNotBlank() }.coerceAtLeast(1) * 32).toFloat())
         portInput = port.toString()
+        manualPortsEnabled = manualPorts
+        serverDtlsPortInput = serverDtlsPort.toString()
+        serverWgPortInput = serverWgPort.toString()
         sniInput = sni
         useTcp = protocol == "tcp"
-        useWVCaptcha = captchaMode == "wv"
-        isManualMode = captchaMethod != "auto"
+        useWVCaptcha = effectiveCaptchaMode == "wv"
+        wbvManualMode = wbvCaptchaMethod != "auto"
+        isManualMode = if (effectiveCaptchaMode == "wv") wbvManualMode else captchaMethod != "auto"
+
+        if (RJS_TEMPORARILY_DISABLED && captchaMode == "rjs") {
+            settingsStore.saveCaptchaMode("wv")
+            settingsStore.saveCaptchaSolveMethod(if (wbvManualMode) "manual" else "auto")
+        }
         
         initialized = true
+    }
+
+    LaunchedEffect(savedManualPortsEnabled) {
+        manualPortsEnabled = savedManualPortsEnabled
+    }
+
+    LaunchedEffect(savedServerDtlsPort) {
+        serverDtlsPortInput = savedServerDtlsPort.toString()
+    }
+
+    LaunchedEffect(savedServerWgPort) {
+        serverWgPortInput = savedServerWgPort.toString()
+    }
+
+    LaunchedEffect(savedListenPort) {
+        portInput = savedListenPort.toString()
     }
 
     if (!initialized) {
@@ -165,9 +212,10 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
         saveJob?.cancel()
         saveJob = scope.launch {
             delay(300)
+            val savedLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
             settingsStore.save(
                 peerInput, combinedHashes, "",
-                workersInput.toInt(), if (useTcp) "tcp" else "udp", 9000, sniInput, false
+                workersInput.toInt(), if (useTcp) "tcp" else "udp", savedLocalPort, sniInput, false
             )
         }
     }
@@ -177,12 +225,78 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
     val isPeerValid = peerInput.isNotBlank() && !peerInput.contains(":")
     val isHashesValid = combinedHashes.isNotBlank()
     val isValid = isPeerValid && isHashesValid && savedConnectionPassword.isNotBlank() && !hasInputHashErrors
+    val effectiveServerDtlsPort = if (manualPortsEnabled) serverDtlsPortInput.toIntOrNull()?.coerceIn(1, 65535) ?: 56000 else 56000
+    val effectiveLocalPort = if (manualPortsEnabled) portInput.toIntOrNull()?.coerceIn(1, 65535) ?: 9000 else 9000
+    var pendingStartAfterVpnPermission by remember { mutableStateOf(false) }
+
+    fun startTunnelService() {
+        val effectiveCaptchaMode = if (RJS_TEMPORARILY_DISABLED) "wv" else if (useWVCaptcha) "wv" else "rjs"
+        val effectiveCaptchaSolveMethod = if (effectiveCaptchaMode == "wv" && isManualMode) "manual" else "auto"
+        saveJob?.cancel()
+        scope.launch {
+            settingsStore.save(
+                peerInput, combinedHashes, "",
+                workersInput.toInt(), if (useTcp) "tcp" else "udp", effectiveLocalPort, sniInput, false
+            )
+            if (RJS_TEMPORARILY_DISABLED) {
+                settingsStore.saveCaptchaMode("wv")
+                settingsStore.saveCaptchaSolveMethod(effectiveCaptchaSolveMethod)
+            }
+        }
+        val intent = Intent(context, TunnelService::class.java).apply {
+            action = "START"
+            putExtra("peer", "$peerInput:$effectiveServerDtlsPort")
+            putExtra("vk_hashes", combinedHashes)
+            putExtra("secondary_vk_hash", "")
+            putExtra("workers_per_hash", workersInput.toInt())
+            putExtra("port", effectiveLocalPort)
+            putExtra("sni", sniInput)
+            putExtra("connection_password", savedConnectionPassword)
+            putExtra("protocol", if (useTcp) "tcp" else "udp")
+            putExtra("captcha_mode", effectiveCaptchaMode)
+            putExtra("captcha_solve_method", effectiveCaptchaSolveMethod)
+        }
+        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
+        else context.startService(intent)
+    }
+
+    val vpnPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (pendingStartAfterVpnPermission) {
+            pendingStartAfterVpnPermission = false
+            if (VpnService.prepare(context) == null) {
+                startTunnelService()
+            } else {
+                Toast.makeText(context, "VPN-разрешение не выдано", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    fun requestVpnAndStart() {
+        val vpnIntent = VpnService.prepare(context)
+        if (vpnIntent != null) {
+            pendingStartAfterVpnPermission = true
+            vpnPermissionLauncher.launch(vpnIntent)
+        } else {
+            startTunnelService()
+        }
+    }
 
     // ═══ Dialogs ═══
     if (showSecretsDialog) {
         SecretsDialog(
             settingsStore = settingsStore,
             initialPassword = savedConnectionPassword,
+            manualPortsEnabled = manualPortsEnabled,
+            initialServerDtlsPort = serverDtlsPortInput,
+            initialServerWgPort = serverWgPortInput,
+            initialLocalPort = portInput,
+            onSaved = { dtls, wg, local ->
+                serverDtlsPortInput = dtls
+                serverWgPortInput = wg
+                portInput = local
+            },
             onDismiss = { showSecretsDialog = false }
         )
     }
@@ -217,72 +331,62 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
         )
 
         // ═══ Настройки туннеля ═══
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        AppSectionCard(
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-
-                OutlinedTextField(
-                    value = peerInput,
-                    onValueChange = {
-                        peerInput = it.filter { c -> c != ' ' }
-                        scheduleSave()
-                    },
-                    label = { Text("IP сервера или домен (без порта)") },
-                    placeholder = { Text("1.2.3.4 (или test.com)") },
-                    singleLine = true,
-                    isError = !isPeerValid && peerInput.isNotEmpty(),
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                    )
+            OutlinedTextField(
+                value = peerInput,
+                onValueChange = {
+                    peerInput = it.filter { c -> c != ' ' }
+                    scheduleSave()
+                },
+                label = { Text("IP сервера или домен (без порта)") },
+                placeholder = { Text("1.2.3.4 (или test.com)") },
+                singleLine = true,
+                isError = !isPeerValid && peerInput.isNotEmpty(),
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = MaterialTheme.colorScheme.primary,
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
                 )
+            )
 
-                OutlinedButton(
-                    onClick = { showHashesDialog = true },
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
-                    ),
-                    border = BorderStroke(
-                        1.dp,
-                        if (hasInputHashErrors) MaterialTheme.colorScheme.error
-                        else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                    )
-                ) {
-                    Icon(Icons.Default.Tag, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Настройка VK Хешей ($filledHashCount/3)", fontWeight = FontWeight.SemiBold)
-                }
+            OutlinedButton(
+                onClick = { showHashesDialog = true },
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    contentColor = MaterialTheme.colorScheme.onSurface
+                ),
+                border = BorderStroke(
+                    1.dp,
+                    if (hasInputHashErrors) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                )
+            ) {
+                Icon(Icons.Default.Tag, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Настройка VK Хешей ($filledHashCount/3)", fontWeight = FontWeight.SemiBold)
+            }
 
-                val errorTexts = hashErrors.filter { !it.contains("короткий") }
-                if (errorTexts.isNotEmpty()) {
-                    Text(
-                        text = errorTexts.joinToString(", "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
+            val errorTexts = hashErrors.filter { !it.contains("короткий") }
+            if (errorTexts.isNotEmpty()) {
+                Text(
+                    text = errorTexts.joinToString(", "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
             }
         }
 
         // ═══ Мощность + Протокол + Капча ═══
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        AppSectionCard(
+            contentPadding = PaddingValues(16.dp),
+            verticalArrangement = Arrangement.spacedBy(0.dp)
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
                 // — Мощность —
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -306,24 +410,18 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
 
                 val maxWorkers = dynamicMaxWorkers
                 val minWorkers = WORKERS_PER_GROUP.toFloat()
-                val totalPositions = ((maxWorkers - minWorkers) / WORKERS_PER_GROUP).toInt() + 1
-                val numSteps = (totalPositions - 2).coerceAtLeast(0)
                 val currentWorkersVal = roundToGroup(currentWorkers.coerceIn(minWorkers, maxWorkers), maxWorkers)
 
-                Slider(
+                CompactSteppedSlider(
                     value = currentWorkersVal,
                     onValueChange = { raw ->
                         workersInput = roundToGroup(raw, maxWorkers)
                         scheduleSave()
                     },
                     valueRange = minWorkers..maxWorkers,
-                    steps = numSteps,
+                    stepSize = WORKERS_PER_GROUP.toFloat(),
                     enabled = !tunnelRunning,
-                    colors = SliderDefaults.colors(
-                        thumbColor = MaterialTheme.colorScheme.primary,
-                        activeTrackColor = MaterialTheme.colorScheme.primary,
-                        inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                    )
+                    modifier = Modifier.fillMaxWidth()
                 )
 
                 // — Разделитель —
@@ -371,13 +469,14 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         ProtocolChip("WBV", useWVCaptcha, enabled = true) {
                             useWVCaptcha = true
-                            isManualMode = true
+                            isManualMode = wbvManualMode
                             scope.launch {
                                 settingsStore.saveCaptchaMode("wv")
-                                settingsStore.saveCaptchaSolveMethod("manual")
+                                settingsStore.saveCaptchaSolveMethod(if (wbvManualMode) "manual" else "auto")
                             }
                         }
-                        ProtocolChip("RJS", !useWVCaptcha, enabled = true) {
+                        ProtocolChip("RJS", !useWVCaptcha, enabled = !RJS_TEMPORARILY_DISABLED, isError = RJS_TEMPORARILY_DISABLED) {
+                            if (RJS_TEMPORARILY_DISABLED) return@ProtocolChip
                             useWVCaptcha = false
                             isManualMode = false
                             scope.launch {
@@ -407,31 +506,37 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
                         modifier = Modifier.weight(1f)
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        ProtocolChip(
-                            "РУЧ",
-                            isManualMode,
-                            enabled = useWVCaptcha,
-                            isError = !useWVCaptcha // Красным, когда активно RJS
-                        ) {
-                            if (useWVCaptcha) {
+                        if (useWVCaptcha) {
+                            ProtocolChip(
+                                "РУЧ",
+                                isManualMode,
+                                enabled = true,
+                                isError = false
+                            ) {
                                 isManualMode = true
-                                scope.launch { settingsStore.saveCaptchaSolveMethod("manual") }
+                                wbvManualMode = true
+                                scope.launch { settingsStore.saveWbvCaptchaSolveMethod("manual") }
                             }
-                        }
-                        ProtocolChip(
-                            "АВТ",
-                            !isManualMode,
-                            enabled = !useWVCaptcha,
-                            isError = useWVCaptcha // Красным, когда активно WBV
-                        ) {
-                            if (!useWVCaptcha) {
+                            ProtocolChip(
+                                "АВТ",
+                                !isManualMode,
+                                enabled = true,
+                                isError = false
+                            ) {
                                 isManualMode = false
-                                scope.launch { settingsStore.saveCaptchaSolveMethod("auto") }
+                                wbvManualMode = false
+                                scope.launch { settingsStore.saveWbvCaptchaSolveMethod("auto") }
                             }
+                        } else {
+                            ProtocolChip(
+                                "АВТ",
+                                selected = true,
+                                enabled = true,
+                                isError = false
+                            ) {}
                         }
                     }
                 }
-            }
         }
 
         // ═══ Кнопки: Секреты + Подключить ═══
@@ -443,6 +548,7 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
                 onClick = { showSecretsDialog = true },
                 modifier = Modifier.height(52.dp),
                 shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.onSurface),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
             ) {
                 Icon(imageVector = Icons.Default.Key, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -463,33 +569,16 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
                             Intent(context, TunnelService::class.java).apply { action = "STOP" }
                         )
                     } else {
-                        saveJob?.cancel()
-                        scope.launch {
-                            settingsStore.save(
-                                peerInput, combinedHashes, "",
-                                workersInput.toInt(), if (useTcp) "tcp" else "udp", 9000, sniInput, false
-                            )
-                        }
-                        val intent = Intent(context, TunnelService::class.java).apply {
-                            action = "START"
-                            putExtra("peer", "$peerInput:56000")
-                            putExtra("vk_hashes", combinedHashes)
-                            putExtra("secondary_vk_hash", "")
-                            putExtra("workers_per_hash", workersInput.toInt())
-                            putExtra("port", 9000)
-                            putExtra("sni", sniInput)
-                            putExtra("connection_password", savedConnectionPassword)
-                            putExtra("protocol", if (useTcp) "tcp" else "udp")
-                            putExtra("captcha_mode", if (useWVCaptcha) "wv" else "rjs")
-                        }
-                        if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
-                        else context.startService(intent)
+                        requestVpnAndStart()
                     }
                 },
                 enabled = (isValid && cooldownSeconds == 0) || tunnelRunning,
                 modifier = Modifier.weight(1f).height(52.dp),
                 shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = buttonColor)
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = buttonColor,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                )
             ) {
                 Icon(
                     imageVector = if (tunnelRunning) Icons.Default.Stop else Icons.Default.PowerSettingsNew,
@@ -508,22 +597,6 @@ fun SettingsTabContent(context: android.content.Context, scope: kotlinx.coroutin
             }
         }
 
-        // ═══ Кнопка Важной информации ═══
-        OutlinedButton(
-            onClick = { showImportantInfoDialog = true },
-            modifier = Modifier.fillMaxWidth().height(50.dp),
-            shape = RoundedCornerShape(16.dp),
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.5f))
-        ) {
-            Icon(Icons.Default.Check, null, Modifier.size(18.dp))
-            Spacer(Modifier.width(8.dp))
-            Text("Пожалуйста ознакомьтесь!", fontWeight = FontWeight.SemiBold)
-        }
-
-        // ═══ Модальное окно с важной информацией ═══
-        if (showImportantInfoDialog) {
-            ImportantInfoDialog(onDismiss = { showImportantInfoDialog = false })
-        }
     }
 }
 
@@ -558,9 +631,102 @@ private fun ProtocolChip(label: String, selected: Boolean, enabled: Boolean = tr
     )
 }
 
+@Composable
+private fun CompactSteppedSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    valueRange: ClosedFloatingPointRange<Float>,
+    stepSize: Float,
+    enabled: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val activeColor = MaterialTheme.colorScheme.primary.copy(alpha = if (enabled) 1f else 0.38f)
+    val inactiveColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (enabled) 1f else 0.55f)
+    val thumbStrokeColor = MaterialTheme.colorScheme.surface
+    val density = LocalDensity.current
+    val thumbRadiusPx = with(density) { 9.dp.toPx() }
+    val trackWidthPx = with(density) { 5.dp.toPx() }
+
+    fun snap(raw: Float): Float {
+        val min = valueRange.start
+        val max = valueRange.endInclusive
+        val snapped = (((raw - min) / stepSize).roundToInt() * stepSize) + min
+        return snapped.coerceIn(min, max)
+    }
+
+    fun positionToValue(x: Float, width: Float): Float {
+        val left = thumbRadiusPx
+        val right = (width - thumbRadiusPx).coerceAtLeast(left + 1f)
+        val fraction = ((x.coerceIn(left, right) - left) / (right - left)).coerceIn(0f, 1f)
+        return snap(valueRange.start + fraction * (valueRange.endInclusive - valueRange.start))
+    }
+
+    Canvas(
+        modifier = modifier
+            .height(34.dp)
+            .pointerInput(enabled, valueRange, stepSize) {
+                if (!enabled) return@pointerInput
+                detectTapGestures { offset ->
+                    onValueChange(positionToValue(offset.x, size.width.toFloat()))
+                }
+            }
+            .pointerInput(enabled, valueRange, stepSize) {
+                if (!enabled) return@pointerInput
+                detectDragGestures { change, _ ->
+                    onValueChange(positionToValue(change.position.x, size.width.toFloat()))
+                }
+            }
+    ) {
+        val centerY = size.height / 2f
+        val left = thumbRadiusPx
+        val right = size.width - thumbRadiusPx
+        val range = (valueRange.endInclusive - valueRange.start).coerceAtLeast(1f)
+        val fraction = ((value - valueRange.start) / range).coerceIn(0f, 1f)
+        val thumbX = left + (right - left) * fraction
+
+        drawLine(
+            color = inactiveColor,
+            start = Offset(left, centerY),
+            end = Offset(right, centerY),
+            strokeWidth = trackWidthPx,
+            cap = StrokeCap.Round
+        )
+        drawLine(
+            color = activeColor,
+            start = Offset(left, centerY),
+            end = Offset(thumbX, centerY),
+            strokeWidth = trackWidthPx,
+            cap = StrokeCap.Round
+        )
+
+        val tickCount = (((valueRange.endInclusive - valueRange.start) / stepSize).roundToInt()).coerceAtLeast(1)
+        repeat(tickCount + 1) { index ->
+            val tickFraction = index / tickCount.toFloat()
+            val tickX = left + (right - left) * tickFraction
+            drawCircle(
+                color = if (tickX <= thumbX) activeColor else inactiveColor,
+                radius = 2.dp.toPx(),
+                center = Offset(tickX, centerY)
+            )
+        }
+
+        drawCircle(
+            color = activeColor,
+            radius = thumbRadiusPx,
+            center = Offset(thumbX, centerY)
+        )
+        drawCircle(
+            color = thumbStrokeColor,
+            radius = thumbRadiusPx,
+            center = Offset(thumbX, centerY),
+            style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx())
+        )
+    }
+}
+
 // ═══ Important Info Dialog ═══
 @Composable
-private fun ImportantInfoDialog(onDismiss: () -> Unit) {
+fun ImportantInfoDialog(onDismiss: () -> Unit) {
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -569,6 +735,7 @@ private fun ImportantInfoDialog(onDismiss: () -> Unit) {
             modifier = Modifier.fillMaxWidth(0.95f).padding(8.dp),
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 6.dp,
         ) {
             Column(modifier = Modifier.padding(24.dp).verticalScroll(rememberScrollState())) {
@@ -602,7 +769,8 @@ private fun ImportantInfoDialog(onDismiss: () -> Unit) {
                 Button(
                     onClick = onDismiss,
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp)
+                    shape = RoundedCornerShape(16.dp),
+                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) {
                     Text("Понятно")
                 }
@@ -621,7 +789,7 @@ private fun InfoSection(title: String, body: String) {
         fontWeight = FontWeight.Bold
     )
     Spacer(Modifier.height(4.dp))
-    Text(body, style = MaterialTheme.typography.bodyMedium)
+    Text(body, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
     Spacer(Modifier.height(4.dp))
 }
 
@@ -662,6 +830,7 @@ fun HashesDialog(
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 8.dp
         ) {
             Column(
@@ -721,7 +890,8 @@ fun HashesDialog(
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = h1.isNotBlank() && h1.length >= 16
+                    enabled = h1.isNotBlank() && h1.length >= 16,
+                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) {
                     Text("Сохранить", fontWeight = FontWeight.SemiBold)
                 }
@@ -736,19 +906,32 @@ fun HashesDialog(
 fun SecretsDialog(
     settingsStore: SettingsStore,
     initialPassword: String,
+    manualPortsEnabled: Boolean,
+    initialServerDtlsPort: String,
+    initialServerWgPort: String,
+    initialLocalPort: String,
+    onSaved: (String, String, String) -> Unit,
     onDismiss: () -> Unit
 ) {
     val scope = rememberCoroutineScope()
-    var passwordInput by remember { mutableStateOf(initialPassword) }
+    var passwordInput by rememberSaveable { mutableStateOf(initialPassword) }
+    var serverDtlsPort by rememberSaveable { mutableStateOf(initialServerDtlsPort.ifBlank { "56000" }) }
+    var serverWgPort by rememberSaveable { mutableStateOf(initialServerWgPort.ifBlank { "56001" }) }
+    var localPort by rememberSaveable { mutableStateOf(initialLocalPort.ifBlank { "9000" }) }
+
+    fun normalizePort(value: String, fallback: String): String {
+        return value.toIntOrNull()?.takeIf { it in 1..65535 }?.toString() ?: fallback
+    }
 
     Dialog(onDismissRequest = onDismiss) {
         Surface(
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = 8.dp
         ) {
             Column(
-                modifier = Modifier.padding(24.dp).fillMaxWidth()
+                modifier = Modifier.padding(24.dp).fillMaxWidth().verticalScroll(rememberScrollState())
             ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -782,18 +965,64 @@ fun SecretsDialog(
                     shape = RoundedCornerShape(16.dp),
                 )
 
+                if (manualPortsEnabled) {
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider()
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Порты", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = serverDtlsPort,
+                        onValueChange = { serverDtlsPort = it.filter(Char::isDigit).take(5) },
+                        label = { Text("Порт сервера DTLS") },
+                        placeholder = { Text("56000") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = serverWgPort,
+                        onValueChange = { serverWgPort = it.filter(Char::isDigit).take(5) },
+                        label = { Text("Порт сервера WireGuard") },
+                        placeholder = { Text("56001") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = localPort,
+                        onValueChange = { localPort = it.filter(Char::isDigit).take(5) },
+                        label = { Text("Локальный порт VPN") },
+                        placeholder = { Text("9000") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                    )
+                }
+
                 Spacer(modifier = Modifier.height(20.dp))
 
                 Button(
                     onClick = {
+                        val finalDtls = normalizePort(serverDtlsPort, "56000")
+                        val finalWg = normalizePort(serverWgPort, "56001")
+                        val finalLocal = normalizePort(localPort, "9000")
                         scope.launch {
                             settingsStore.saveConnectionPassword(passwordInput)
+                            settingsStore.savePorts(finalDtls.toInt(), finalWg.toInt(), finalLocal.toInt())
+                            onSaved(finalDtls, finalWg, finalLocal)
+                            onDismiss()
                         }
-                        onDismiss()
                     },
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = RoundedCornerShape(16.dp),
-                    enabled = passwordInput.isNotEmpty()
+                    enabled = passwordInput.isNotEmpty(),
+                    colors = ButtonDefaults.buttonColors(contentColor = MaterialTheme.colorScheme.onPrimary)
                 ) {
                     Text("Сохранить", fontWeight = FontWeight.SemiBold)
                 }

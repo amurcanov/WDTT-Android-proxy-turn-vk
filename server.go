@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	mrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -36,15 +35,15 @@ import (
 )
 
 const (
-	wgIfaceName    = "wg0"
-	wgServerAddr   = "10.66.66.1"
-	wgClientAddr   = "10.66.66.2"
-	wgClientCIDR   = wgClientAddr + "/32"
-	wgServerCIDR   = wgServerAddr + "/24"
-	internalWGPort = 56001
-	dns            = "1.1.1.1"
-	wgMTU          = 1280
-	keepalive      = 25
+	wgIfaceName           = "wdtt0"
+	wgServerAddr          = "10.66.66.1"
+	wgClientAddr          = "10.66.66.2"
+	wgClientCIDR          = wgClientAddr + "/32"
+	wgServerCIDR          = wgServerAddr + "/24"
+	defaultInternalWGPort = 56001
+	dns                   = "1.1.1.1"
+	wgMTU                 = 1280
+	keepalive             = 25
 )
 
 // ==================== База данных и Бот ====================
@@ -93,8 +92,16 @@ const passChars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789"
 
 func generatePassword() string {
 	b := make([]byte, 7)
-	for i := range b {
-		b[i] = passChars[mrand.Intn(len(passChars))]
+	randomBytes := make([]byte, len(b))
+	if _, err := rand.Read(randomBytes); err != nil {
+		now := time.Now().UnixNano()
+		for i := range b {
+			b[i] = passChars[int(now+int64(i))%len(passChars)]
+		}
+		return string(b)
+	}
+	for i, raw := range randomBytes {
+		b[i] = passChars[int(raw)%len(passChars)]
 	}
 	return string(b)
 }
@@ -576,12 +583,22 @@ func runCmdSilent(name string, args ...string) string {
 	return strings.TrimSpace(string(out))
 }
 
+func commandExists(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+func isNetTimeout(err error) bool {
+	ne, ok := err.(net.Error)
+	return ok && ne.Timeout()
+}
+
 func getDefaultInterface() string {
 	out := runCmdSilent("bash", "-c", "ip route show default | awk '/default/ {print $5}' | head -1")
 	if out != "" {
 		return strings.TrimSpace(out)
 	}
-	out = runCmdSilent("bash", "-c", "ip -o link show | awk -F': ' '{print $2}' | grep -v -E 'lo|wg|tun' | head -1")
+	out = runCmdSilent("bash", "-c", "ip -o link show | awk -F': ' '{print $2}' | grep -v -E 'lo|wg|tun|wdtt' | head -1")
 	if out != "" {
 		return strings.TrimSpace(out)
 	}
@@ -666,40 +683,59 @@ func setupFullConeNAT(wgIface string) error {
 	log.Println("[NAT] ══════════════════════════════════════")
 
 	os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1"), 0644)
-	os.WriteFile(fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/disable_ipv6", wgIface), []byte("1"), 0644)
-	os.WriteFile("/proc/sys/net/ipv6/conf/all/disable_ipv6", []byte("1"), 0644)
 
 	extIface := getDefaultInterface()
 	log.Printf("[NAT] Внешний: %s", extIface)
 
-	// Очистка старых MASQUERADE правил
-	for i := 0; i < 5; i++ {
-		exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", wgServerCIDR, "-o", extIface, "-j", "MASQUERADE").Run()
+	switch {
+	case commandExists("iptables"):
+		for i := 0; i < 5; i++ {
+			exec.Command("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", wgServerCIDR, "-o", extIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "MASQUERADE").Run()
+		}
+		exec.Command("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", wgServerCIDR, "-o", extIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "MASQUERADE").Run()
+		natType = "MASQUERADE iptables ✅"
+		setupForwardRules(wgIface)
+	case commandExists("nft"):
+		setupNftNAT(extIface)
+		natType = "MASQUERADE nft ✅"
+		setupForwardRules(wgIface)
+	default:
+		natType = "NAT не настроен: нет iptables/nft"
+		log.Printf("[NAT] WARNING: %s", natType)
 	}
 
-	// Установка MASQUERADE (основной NAT)
-	exec.Command("iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-s", wgServerCIDR, "-o", extIface, "-j", "MASQUERADE").Run()
-	natType = "MASQUERADE ✅"
-
-	setupForwardRules(wgIface)
 	log.Printf("[NAT] Режим: %s", natType)
 	log.Println("[NAT] ══════════════════════════════════════")
 	return nil
 }
 
+func setupNftNAT(extIface string) {
+	exec.Command("nft", "add", "table", "ip", "wdtt").Run()
+	exec.Command("nft", "add", "chain", "ip", "wdtt", "postrouting", "{ type nat hook postrouting priority 100; }").Run()
+	exec.Command("nft", "add", "rule", "ip", "wdtt", "postrouting", "ip", "saddr", wgServerCIDR, "oifname", extIface, "masquerade").Run()
+}
+
 func setupForwardRules(wgIface string) {
-	for i := 0; i < 5; i++ {
-		exec.Command("iptables", "-D", "FORWARD", "-i", wgIface, "-j", "ACCEPT").Run()
-		exec.Command("iptables", "-D", "FORWARD", "-o", wgIface, "-j", "ACCEPT").Run()
+	if commandExists("iptables") {
+		for i := 0; i < 5; i++ {
+			exec.Command("iptables", "-D", "FORWARD", "-i", wgIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "ACCEPT").Run()
+			exec.Command("iptables", "-D", "FORWARD", "-o", wgIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "ACCEPT").Run()
+		}
+		exec.Command("iptables", "-A", "FORWARD", "-i", wgIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "ACCEPT").Run()
+		exec.Command("iptables", "-A", "FORWARD", "-o", wgIface, "-m", "comment", "--comment", "WDTT_MANAGED", "-j", "ACCEPT").Run()
+		return
 	}
-	exec.Command("iptables", "-A", "FORWARD", "-i", wgIface, "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-o", wgIface, "-j", "ACCEPT").Run()
-	exec.Command("iptables", "-A", "FORWARD", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT").Run()
+	if commandExists("nft") {
+		exec.Command("nft", "add", "table", "inet", "wdtt").Run()
+		exec.Command("nft", "add", "chain", "inet", "wdtt", "forward", "{ type filter hook forward priority 0; policy accept; }").Run()
+		exec.Command("nft", "add", "rule", "inet", "wdtt", "forward", "iifname", wgIface, "accept").Run()
+		exec.Command("nft", "add", "rule", "inet", "wdtt", "forward", "oifname", wgIface, "accept").Run()
+	}
 }
 
 // ==================== WireGuard ====================
 
-func startUserspaceWG(keys *wgKeys) (*device.Device, error) {
+func startUserspaceWG(keys *wgKeys, wgPort int) (*device.Device, error) {
 	runCmdSilent("ip", "link", "del", wgIfaceName)
 	time.Sleep(100 * time.Millisecond)
 
@@ -722,7 +758,7 @@ func startUserspaceWG(keys *wgKeys) (*device.Device, error) {
 
 	if err := dev.IpcSet(fmt.Sprintf(
 		"private_key=%s\nlisten_port=%d\n",
-		serverPrivHex, internalWGPort,
+		serverPrivHex, wgPort,
 	)); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("IpcSet: %w", err)
@@ -769,7 +805,7 @@ func startUserspaceWG(keys *wgKeys) (*device.Device, error) {
 		}
 	}()
 
-	log.Printf("[WG] Запущен на порту %d", internalWGPort)
+	log.Printf("[WG] Запущен на порту %d", wgPort)
 	return dev, nil
 }
 
@@ -808,14 +844,12 @@ PersistentKeepalive = %d`,
 
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "DTLS адрес")
-	wgPort := flag.Int("wg-port", internalWGPort, "WireGuard UDP порт")
-	configDir := flag.String("config-dir", "/etc/wireguard", "директория конфигурации")
+	wgPort := flag.Int("wg-port", defaultInternalWGPort, "WireGuard UDP порт")
+	configDir := flag.String("config-dir", "/etc/wdtt", "директория конфигурации")
 	mainPass := flag.String("password", "", "пароль владельца")
 	adminID := flag.String("admin", "", "Telegram Admin ID")
 	botToken := flag.String("bot-token", "", "Telegram Bot Token")
 	flag.Parse()
-
-	_ = wgPort // WG порт задаётся через internalWGPort (56001)
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("══════════════════════════════════════════")
@@ -843,7 +877,7 @@ func main() {
 
 	enableBBR()
 
-	wgDev, err := startUserspaceWG(keys)
+	wgDev, err := startUserspaceWG(keys, *wgPort)
 	if err != nil {
 		log.Fatalf("[WG] Запуск: %v", err)
 	}
@@ -870,7 +904,7 @@ func main() {
 	}
 	context.AfterFunc(ctx, func() { listener.Close() })
 
-	wgEndpoint := fmt.Sprintf("127.0.0.1:%d", internalWGPort)
+	wgEndpoint := fmt.Sprintf("127.0.0.1:%d", *wgPort)
 
 	log.Printf("   DTLS: %s | WG: %s | NAT: %s", *listen, wgEndpoint, natType)
 	log.Println("[SERVER] Готов")
@@ -1037,7 +1071,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		uc.SetWriteBuffer(2 * 1024 * 1024)
 	}
 
-	wgConn.Write(firstPacket)
+	if _, err := wgConn.Write(firstPacket); err != nil {
+		return
+	}
 	atomic.AddInt64(&totalBytesFromClient, int64(len(firstPacket)))
 
 	// Трекинг онлайн-статуса
@@ -1077,7 +1113,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 			case <-pctx.Done():
 				return
 			case <-ticker.C:
-				clientConn.Write([]byte("WAKEUP"))
+				if _, err := clientConn.Write([]byte("WAKEUP")); err != nil {
+					return
+				}
 			}
 		}
 	}()
@@ -1089,6 +1127,11 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		b := getBuf()
 		defer putBuf(b)
 		for {
+			select {
+			case <-pctx.Done():
+				return
+			default:
+			}
 			clientConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 			nn, err := clientConn.Read(*b)
 			if err != nil {
@@ -1108,7 +1151,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				dbMutex.Unlock()
 			}
-			wgConn.Write((*b)[:nn])
+			if _, err := wgConn.Write((*b)[:nn]); err != nil {
+				return
+			}
 		}
 	}()
 
@@ -1119,11 +1164,18 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 		b := getBuf()
 		defer putBuf(b)
 		for {
+			select {
+			case <-pctx.Done():
+				return
+			default:
+			}
 			wgConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 			nn, err := wgConn.Read(*b)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					// Игнорируем таймауты wgConn. Это нормально, если нет трафика (idle)
+				if isNetTimeout(err) {
+					if pctx.Err() != nil {
+						return
+					}
 					continue
 				}
 				return
@@ -1139,7 +1191,9 @@ func handleConn(ctx context.Context, clientConn net.Conn, wgEndpoint string, wgD
 				}
 				dbMutex.Unlock()
 			}
-			clientConn.Write((*b)[:nn])
+			if _, err := clientConn.Write((*b)[:nn]); err != nil {
+				return
+			}
 		}
 	}()
 

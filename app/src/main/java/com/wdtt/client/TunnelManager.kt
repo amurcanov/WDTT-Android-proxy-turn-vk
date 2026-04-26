@@ -43,7 +43,8 @@ object TunnelManager {
     private var currentParams: TunnelParams? = null
     private var lastContext: Context? = null
     private var forceRegenerateUA = false // принудительная перегенерация UA при ошибках
-    private var currentCaptchaMode = "rjs" // режим обхода капчи: "wv" или "rjs"
+    private var currentCaptchaMode = "wv" // режим обхода капчи: "wv" или "rjs"
+    private var currentCaptchaSolveMethod = "auto" // "manual" или "auto"
 
     val running = MutableStateFlow(false)
     val logs = MutableStateFlow<List<LogEntry>>(emptyList())
@@ -106,6 +107,8 @@ object TunnelManager {
         
         if (!isSwitching) {
             clearLogs()
+            config.value = null
+            stats.value = "Ожидание данных..."
             floodCount = 0
             mismatchCount = 0
             refusedCount = 0
@@ -115,6 +118,7 @@ object TunnelManager {
             lastContext = appContext
             forceRegenerateUA = false
             currentCaptchaMode = params.captchaMode
+            currentCaptchaSolveMethod = params.captchaSolveMethod
         }
         
         wgHelper = WireGuardHelper(appContext)
@@ -252,21 +256,17 @@ object TunnelManager {
                         return@forEachLine
                     }
 
-                    // 0b. CAPTCHA_SOLVE — запрос от Go для WV-режима
+                    // 0b. CAPTCHA_SOLVE — запрос от Go для WBV или fallback из RJS
                     if (lineTrim.startsWith("CAPTCHA_SOLVE|")) {
-                        if (currentCaptchaMode == "wv") {
-                            val parts = lineTrim.substringAfter("CAPTCHA_SOLVE|").split("|", limit = 2)
-                            if (parts.size == 2) {
-                                val redirectUri = parts[0]
-                                val sessionToken = parts[1]
-                                scope.launch {
-                                    handleCaptchaSolve(redirectUri, sessionToken)
-                                }
-                            } else {
-                                writeCaptchaResult("error:invalid CAPTCHA_SOLVE format")
+                        val parts = lineTrim.substringAfter("CAPTCHA_SOLVE|").split("|", limit = 2)
+                        if (parts.size == 2) {
+                            val redirectUri = parts[0]
+                            val sessionToken = parts[1]
+                            scope.launch {
+                                handleCaptchaSolve(redirectUri, sessionToken)
                             }
                         } else {
-                            writeCaptchaResult("error:wv mode not enabled")
+                            writeCaptchaResult("error:invalid CAPTCHA_SOLVE format")
                         }
                         return@forEachLine
                     }
@@ -405,7 +405,7 @@ object TunnelManager {
                                 try {
                                     wgHelper?.startTunnel(configStr)
                                 } catch (e: Exception) {
-                                    updateLog("vpn_start_error", "Ошибка запуска VPN: ${e.message}", 99, true)
+                                    updateLog("vpn_start_error", "Ошибка запуска VPN: ${e.readableMessage()}", 99, true)
                                 }
                             }
                         } else if (line.contains("║")) {
@@ -594,15 +594,35 @@ object TunnelManager {
 
     /**
      * Вызывается при получении CAPTCHA_SOLVE от Go-процесса.
-     * Решает капчу через CaptchaWebViewManager (создаёт свежий WebView → решает → уничтожает).
+     * Ручной режим сразу открывает видимый WebView.
+     * Авто-режим сначала пробует скрытый WebView для checkbox, а slider отдаёт в ручной fallback.
      * Результат ВСЕГДА отправляется обратно в Go через writeCaptchaResult.
      */
     private suspend fun handleCaptchaSolve(redirectUri: String, sessionToken: String) {
-        updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание WebView...", 5, false)
+        val ctx = lastContext ?: run {
+            writeCaptchaResult("error:context is null")
+            return
+        }
 
         try {
-            val ctx = lastContext ?: return
-            val token = ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
+            val token = if (currentCaptchaSolveMethod == "auto") {
+                updateLog("captcha_wv_step_1", "[КАПЧА WBV] Авто WebView...", 5, false)
+                try {
+                    CaptchaWebViewManager.solveCaptchaAsync(redirectUri, sessionToken) { step ->
+                        updateLog("captcha_wv_auto_step", "[КАПЧА WBV] $step", 5, false)
+                    }
+                } catch (e: Exception) {
+                    if (e.message == CaptchaWebViewManager.ERROR_SLIDER_DETECTED) {
+                        updateLog("captcha_wv_fallback", "[КАПЧА WBV] Обнаружен слайдер, открыт ручной WebView", 5, false)
+                        ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
+                    } else {
+                        throw e
+                    }
+                }
+            } else {
+                updateLog("captcha_wv_step_1", "[КАПЧА WBV] Создание ручного WebView...", 5, false)
+                ManlCaptchaWebViewManager.solveCaptchaAsync(ctx, redirectUri, sessionToken)
+            }
             updateLog("captcha_wv_step_4", "[КАПЧА WBV] Капча решена ✓", 5, false)
             writeCaptchaResult(token)
         } catch (e: IllegalStateException) {
@@ -623,7 +643,7 @@ object TunnelManager {
             writeCaptchaResult("error:$errorMsg")
         }
 
-        // WebView уничтожен в finally блоке solveCaptchaAsync
+        // WebView уничтожен в finally блоке соответствующего менеджера.
         updateLog("captcha_wv_step_6", "[КАПЧА WBV] WebView уничтожен", 5, false)
     }
 
@@ -657,6 +677,11 @@ object TunnelManager {
             }
         }
     }
+
+    private fun Throwable.readableMessage(): String {
+        val text = message ?: localizedMessage
+        return if (text.isNullOrBlank()) this::class.java.simpleName else "${this::class.java.simpleName}: $text"
+    }
 }
 
 data class TunnelParams(
@@ -668,5 +693,6 @@ data class TunnelParams(
     val sni: String = "",
     val connectionPassword: String = "",
     val protocol: String = "udp",
-    val captchaMode: String = "rjs" // "wv" или "rjs"
+    val captchaMode: String = "wv", // "wv" или "rjs"
+    val captchaSolveMethod: String = "auto" // "manual" или "auto"
 )

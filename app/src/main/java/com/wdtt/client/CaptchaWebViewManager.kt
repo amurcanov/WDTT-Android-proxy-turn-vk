@@ -42,6 +42,7 @@ object CaptchaWebViewManager {
     private const val TAG = "CaptchaWV"
     private const val CAPTCHA_TIMEOUT_MS = 45_000L
     private const val WV_CREATE_TIMEOUT_MS = 3000L
+    const val ERROR_SLIDER_DETECTED = "slider_detected"
 
     // Рандомизируемые параметры viewport (чтобы VK не видел одинаковый size)
     private val VIEWPORT_WIDTHS = intArrayOf(356, 358, 360, 362, 364, 366, 368)
@@ -63,6 +64,7 @@ object CaptchaWebViewManager {
     private var appContext: Context? = null
 
     private val pendingResult = AtomicReference<CompletableDeferred<Result<String>>?>(null)
+    private val postClickSliderWatcher = AtomicReference<Runnable?>(null)
 
     @Volatile
     private var currentWebView: WebView? = null
@@ -84,6 +86,11 @@ object CaptchaWebViewManager {
                         const data = await clone.json();
                         if (data.response && data.response.success_token) {
                             window.WdttCaptcha.onSuccess(data.response.success_token);
+                        } else if (
+                            data.response &&
+                            data.response.show_captcha_type === 'slider'
+                        ) {
+                            window.WdttCaptcha.onSliderDetected('check_response');
                         } else if (data.error) {
                             window.WdttCaptcha.onError(JSON.stringify(data.error));
                         }
@@ -107,6 +114,11 @@ object CaptchaWebViewManager {
                             const data = JSON.parse(xhr.responseText);
                             if (data.response && data.response.success_token) {
                                 window.WdttCaptcha.onSuccess(data.response.success_token);
+                            } else if (
+                                data.response &&
+                                data.response.show_captcha_type === 'slider'
+                            ) {
+                                window.WdttCaptcha.onSliderDetected('check_response');
                             } else if (data.error) {
                                 window.WdttCaptcha.onError(JSON.stringify(data.error));
                             }
@@ -317,6 +329,7 @@ object CaptchaWebViewManager {
     private fun destroyCurrentWebView() {
         val wv = currentWebView ?: return
         currentWebView = null
+        postClickSliderWatcher.getAndSet(null)?.let { mainHandler.removeCallbacks(it) }
 
         val destroyAction = Runnable {
             try {
@@ -361,9 +374,17 @@ object CaptchaWebViewManager {
     private fun solveCaptchaAutomatedSync(webView: WebView) {
         if (currentWebView !== webView || !isTunnelActive) return
 
-        // Ищем LABEL целиком (он большой, ~200x32px — как человек кликает)
+        // Ищем LABEL целиком (он большой, ~200x32px — как человек кликает).
+        // Если вместо checkbox открыт slider/kaleidoscope, скрытый WebView сразу отдаёт fallback ручному WV.
         val findLabelJS = """
             (function() {
+                var slider = document.querySelector(
+                    '[class*="SliderCaptcha"], [class*="Kaleidoscope"], ' +
+                    '.vkc__SliderCaptcha-module__description, ' +
+                    '.vkc__KaleidoscopeScreen-module__captchaId'
+                );
+                if (slider) return '${ERROR_SLIDER_DETECTED}';
+
                 // Приоритет: label обёртка (самый большой кликабельный элемент)
                 var el = document.querySelector('label.vkc__Checkbox-module__Checkbox');
                 // Fallback: прямой поиск по ID
@@ -389,6 +410,12 @@ object CaptchaWebViewManager {
 
             if (currentWebView !== webView || !isTunnelActive) return@evaluateJavascript
 
+            if (result == ERROR_SLIDER_DETECTED) {
+                Log.i(TAG, "Обнаружен слайдер — fallback на ручной WebView")
+                notifyResult(Result.failure(IllegalStateException(ERROR_SLIDER_DETECTED)))
+                return@evaluateJavascript
+            }
+
             if (result == "not_found" || result.split(",").size < 4) {
                 // Fallback: JS .click() — не идеально, но лучше чем ничего
                 Log.w(TAG, "Label не найден — JS-клик (fallback)")
@@ -400,7 +427,11 @@ object CaptchaWebViewManager {
                         return 'nothing';
                     })();
                 """.trimIndent()
-                webView.evaluateJavascript(jsClick, null)
+                webView.evaluateJavascript(jsClick) { clickResult ->
+                    if ((clickResult ?: "").replace("\"", "") == "clicked") {
+                        startPostClickSliderWatcher(webView)
+                    }
+                }
                 return@evaluateJavascript
             }
 
@@ -423,9 +454,66 @@ object CaptchaWebViewManager {
             mainHandler.postDelayed({
                 if (currentWebView === webView && isTunnelActive) {
                     simulateHumanTouch(webView, randX, randY)
+                    startPostClickSliderWatcher(webView)
                 }
             }, thinkDelay)
         }
+    }
+
+    private fun startPostClickSliderWatcher(webView: WebView) {
+        postClickSliderWatcher.getAndSet(null)?.let { mainHandler.removeCallbacks(it) }
+
+        var attemptsLeft = 12
+        val watcher = object : Runnable {
+            override fun run() {
+                if (currentWebView !== webView || !isTunnelActive) return
+
+                val detectSliderJS = """
+                    (function() {
+                        var slider = document.querySelector(
+                            '[class*="SliderCaptcha"], [class*="Kaleidoscope"], ' +
+                            '.vkc__SliderCaptcha-module__description, ' +
+                            '.vkc__KaleidoscopeScreen-module__captchaId, ' +
+                            '.vkc__SwipeButton-module__track'
+                        );
+                        if (slider) return 'slider';
+
+                        var success = document.querySelector(
+                            '[class*="success"], [class*="Success"], [class*="passed"], [class*="Passed"]'
+                        );
+                        if (success) return 'success_ui';
+
+                        return 'none';
+                    })();
+                """.trimIndent()
+
+                webView.evaluateJavascript(detectSliderJS) { rawValue ->
+                    if (currentWebView !== webView || !isTunnelActive) return@evaluateJavascript
+
+                    val result = rawValue?.replace("\"", "") ?: "none"
+                    when (result) {
+                        "slider" -> {
+                            Log.i(TAG, "После checkbox появился слайдер — fallback на ручной WebView")
+                            notifyResult(Result.failure(IllegalStateException(ERROR_SLIDER_DETECTED)))
+                        }
+                        "success_ui" -> {
+                            postClickSliderWatcher.set(null)
+                        }
+                        else -> {
+                            attemptsLeft--
+                            if (attemptsLeft > 0) {
+                                mainHandler.postDelayed(this, 650L)
+                            } else {
+                                postClickSliderWatcher.set(null)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        postClickSliderWatcher.set(watcher)
+        mainHandler.postDelayed(watcher, 900L)
     }
 
     /**
@@ -481,6 +569,12 @@ object CaptchaWebViewManager {
         fun onSuccess(token: String) {
             Log.d(TAG, "JS: success_token получен (${token.length} символов)")
             notifyResult(Result.success(token))
+        }
+
+        @JavascriptInterface
+        fun onSliderDetected(source: String) {
+            Log.i(TAG, "JS: обнаружен slider после auto-step ($source)")
+            notifyResult(Result.failure(IllegalStateException(ERROR_SLIDER_DETECTED)))
         }
 
         @JavascriptInterface

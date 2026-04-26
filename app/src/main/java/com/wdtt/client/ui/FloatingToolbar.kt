@@ -9,15 +9,21 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
@@ -26,13 +32,18 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wdtt.client.R
-import kotlin.math.abs
+import android.os.Build
+import androidx.compose.ui.graphics.Color
 import kotlin.math.roundToInt
 
 @Composable
 fun FloatingToolbar(
     currentTheme: String,
     onThemeChange: (String) -> Unit,
+    isDynamicColor: Boolean,
+    onDynamicColorChange: (Boolean) -> Unit,
+    currentPalette: String,
+    onPaletteChange: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val configuration = LocalConfiguration.current
@@ -44,40 +55,57 @@ fun FloatingToolbar(
         with(density) { configuration.screenWidthDp.dp.toPx() }
     }
 
-    // Позиция и состояние
-    var offsetY by rememberSaveable { mutableFloatStateOf(screenHeightPx * 0.25f) }
+    var offsetY by rememberSaveable { mutableFloatStateOf(-1f) }
     var isRightSide by rememberSaveable { mutableStateOf(true) }
     var isExpanded by rememberSaveable { mutableStateOf(false) }
+    var tabHeightPx by remember { mutableFloatStateOf(0f) }
+    var panelHeightPx by remember { mutableFloatStateOf(0f) }
 
-    // Размеры таба
     val tabWidthDp = 42.dp
     val tabHeightDp = 52.dp
-    val panelWidthDp = 180.dp
+    val panelWidthDp = 220.dp
 
     val tabWidthPx = remember(density) { with(density) { tabWidthDp.toPx() } }
+    val fallbackTabHeightPx = remember(density) { with(density) { tabHeightDp.toPx() } }
+    val edgePaddingPx = remember(density) { with(density) { 8.dp.toPx() } }
+    val safeTopPx = WindowInsets.safeDrawing.getTop(density).toFloat()
+    val safeBottomPx = WindowInsets.safeDrawing.getBottom(density).toFloat()
+    val effectiveTabHeightPx = maxOf(tabHeightPx, fallbackTabHeightPx)
+    val floatingHeightPx = if (isExpanded && panelHeightPx > 0f) {
+        maxOf(effectiveTabHeightPx, panelHeightPx)
+    } else {
+        effectiveTabHeightPx
+    }
+    val minOffsetY = safeTopPx + edgePaddingPx
+    val maxOffsetY = (screenHeightPx - safeBottomPx - floatingHeightPx - edgePaddingPx)
+        .coerceAtLeast(minOffsetY)
+    val defaultOffsetY = (screenHeightPx * 0.24f).coerceIn(minOffsetY, maxOffsetY)
 
-    // X позиция вычисляется в layout-фазе — без рекомпозиции
     val targetXPx = if (isRightSide) screenWidthPx - tabWidthPx else 0f
 
-    // Анимация "отодвигания" ярлыка при открытии меню
     val animatedTabXPx by animateFloatAsState(
         targetValue = targetXPx,
         animationSpec = spring(stiffness = Spring.StiffnessLow),
         label = "tab_shift"
     )
 
+    LaunchedEffect(minOffsetY, maxOffsetY) {
+        offsetY = if (offsetY < 0f) defaultOffsetY else offsetY.coerceIn(minOffsetY, maxOffsetY)
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
-        // Ярлычок (таб)
         Surface(
             onClick = { isExpanded = !isExpanded },
             modifier = Modifier
                 .offset { IntOffset(animatedTabXPx.roundToInt(), offsetY.roundToInt()) }
-                .pointerInput(screenWidthPx, screenHeightPx) {
+                .onGloballyPositioned { coordinates ->
+                    tabHeightPx = coordinates.size.height.toFloat()
+                }
+                .pointerInput(minOffsetY, maxOffsetY) {
                     detectDragGestures(
                         onDrag = { change, dragAmount ->
                             change.consume()
-                            // Только вертикальное перемещение
-                            offsetY = (offsetY + dragAmount.y).coerceIn(0f, screenHeightPx * 0.7f)
+                            offsetY = (offsetY + dragAmount.y).coerceIn(minOffsetY, maxOffsetY)
                         }
                     )
                 },
@@ -102,7 +130,6 @@ fun FloatingToolbar(
             }
         }
 
-        // Выдвижная панель
         AnimatedVisibility(
             visible = isExpanded,
             enter = fadeIn(),
@@ -119,7 +146,10 @@ fun FloatingToolbar(
             }
         ) {
             Surface(
-                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.onGloballyPositioned { coordinates ->
+                    panelHeightPx = coordinates.size.height.toFloat()
+                },
+                shape = RoundedCornerShape(32.dp),
                 color = MaterialTheme.colorScheme.surface,
                 shadowElevation = 8.dp,
                 tonalElevation = 4.dp,
@@ -154,6 +184,62 @@ fun FloatingToolbar(
                         selected = currentTheme == "dark",
                         onClick = { onThemeChange("dark"); isExpanded = false }
                     )
+
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 4.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                    )
+
+                    val supportsDynamicColor = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    val showDynamicColorOn = isDynamicColor && supportsDynamicColor
+                    val showPalettes = !showDynamicColorOn
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "Динамические",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium,
+                            color = if (supportsDynamicColor) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                            }
+                        )
+                        Switch(
+                            checked = showDynamicColorOn,
+                            onCheckedChange = { onDynamicColorChange(it) },
+                            enabled = supportsDynamicColor,
+                            modifier = Modifier.scale(0.8f)
+                        )
+                    }
+
+                    AnimatedVisibility(visible = showPalettes) {
+                        Column {
+                            HorizontalDivider(
+                                modifier = Modifier.padding(vertical = 4.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                            )
+                            Text(
+                                "Палитра",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(bottom = 6.dp, start = 4.dp)
+                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceEvenly
+                            ) {
+                                PaletteCircle("indigo", 0xFF5B588D, currentPalette, onPaletteChange)
+                                PaletteCircle("forest", 0xFF5F5D68, currentPalette, onPaletteChange)
+                                PaletteCircle("espresso", 0xFF6D4C41, currentPalette, onPaletteChange)
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                        }
+                    }
                 }
             }
         }
@@ -169,7 +255,7 @@ private fun ThemeOption(
 ) {
     Surface(
         onClick = onClick,
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(24.dp),
         color = if (selected) MaterialTheme.colorScheme.primaryContainer
         else MaterialTheme.colorScheme.surface,
     ) {
@@ -195,4 +281,25 @@ private fun ThemeOption(
             )
         }
     }
+}
+
+@Composable
+fun PaletteCircle(
+    paletteId: String,
+    colorHex: Long,
+    selectedId: String,
+    onClick: (String) -> Unit
+) {
+    val isSelected = paletteId == selectedId
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(Color(colorHex))
+            .clickable { onClick(paletteId) }
+            .then(
+                if (isSelected) Modifier.border(3.dp, MaterialTheme.colorScheme.primary, CircleShape)
+                else Modifier
+            )
+    )
 }

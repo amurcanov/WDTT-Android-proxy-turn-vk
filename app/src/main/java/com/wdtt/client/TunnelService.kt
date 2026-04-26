@@ -26,10 +26,15 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+private const val TUNNEL_NOTIFICATION_CHANNEL_ID = "wdtt_tunnel_v4"
+private const val TUNNEL_NOTIFICATION_ID = 1
+private const val RJS_TEMPORARILY_DISABLED = true
+
 class TunnelService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var updateJob: Job? = null
+    private var lastNotificationText: String? = null
     
     // Network Monitoring
     private var connectivityManager: ConnectivityManager? = null
@@ -55,11 +60,7 @@ class TunnelService : Service() {
         when (intent.action) {
             "START" -> {
                 val notification = createNotification("Запуск...")
-                if (Build.VERSION.SDK_INT >= 29) {
-                    startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-                } else {
-                    startForeground(1, notification)
-                }
+                startPersistentForeground(notification)
 
                 val params = TunnelParams(
                     peer = intent.getStringExtra("peer") ?: "",
@@ -70,18 +71,15 @@ class TunnelService : Service() {
                     sni = intent.getStringExtra("sni") ?: "",
                     connectionPassword = intent.getStringExtra("connection_password") ?: "",
                     protocol = intent.getStringExtra("protocol") ?: "udp",
-                    captchaMode = intent.getStringExtra("captcha_mode") ?: "rjs"
+                    captchaMode = sanitizeCaptchaMode(intent.getStringExtra("captcha_mode")),
+                    captchaSolveMethod = intent.getStringExtra("captcha_solve_method") ?: "auto"
                 )
                 startTunnel(params)
             }
             "STOP" -> stopTunnel()
             "DEPLOY_START" -> {
                 val notification = createNotification("Установка на сервер...", "DEPLOY_CANCEL", "Отменить")
-                if (Build.VERSION.SDK_INT >= 29) {
-                    startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-                } else {
-                    startForeground(1, notification)
-                }
+                startPersistentForeground(notification)
                 acquireWakeLock()
             }
             "DEPLOY_CANCEL" -> {
@@ -93,7 +91,7 @@ class TunnelService : Service() {
                 if (!TunnelManager.running.value) {
                     stopTunnel()
                 } else {
-                    updateNotification(TunnelManager.stats.value)
+                    updateNotification("Туннель активен")
                 }
             }
         }
@@ -102,25 +100,26 @@ class TunnelService : Service() {
 
     private fun restoreTunnel() {
         val notification = createNotification("Восстановление соединения...")
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(1, notification)
-        }
+        startPersistentForeground(notification)
         
         val appContext = applicationContext
         TunnelManager.scope.launch {
             try {
                 val store = SettingsStore(appContext)
+                val basePeer = store.peer.first()
+                val manualPortsEnabled = store.manualPortsEnabled.first()
+                val serverDtlsPort = if (manualPortsEnabled) store.serverDtlsPort.first() else 56000
+                val peerWithPort = if (basePeer.isBlank() || basePeer.contains(":")) basePeer else "$basePeer:$serverDtlsPort"
                 val params = TunnelParams(
-                    peer = store.peer.first(),
+                    peer = peerWithPort,
                     vkHashes = store.vkHashes.first(),
                     secondaryVkHash = store.secondaryVkHash.first(),
                     workersPerHash = store.workersPerHash.first(),
                     port = store.listenPort.first(),
                     sni = store.sni.first(),
                     connectionPassword = store.connectionPassword.first(),
-                    captchaMode = store.captchaMode.first()
+                    captchaMode = sanitizeCaptchaMode(store.captchaMode.first()),
+                    captchaSolveMethod = store.captchaSolveMethod.first()
                 )
                 if (params.peer.isNotEmpty() && params.vkHashes.isNotEmpty()) {
                     launch(Dispatchers.Main) {
@@ -221,6 +220,12 @@ class TunnelService : Service() {
         }
     }
 
+    private fun sanitizeCaptchaMode(mode: String?): String {
+        val normalized = mode?.lowercase() ?: "wv"
+        if (RJS_TEMPORARILY_DISABLED && normalized == "rjs") return "wv"
+        return if (normalized == "wv" || normalized == "rjs") normalized else "wv"
+    }
+
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val pm = getSystemService(POWER_SERVICE) as PowerManager
@@ -277,19 +282,27 @@ class TunnelService : Service() {
                     break
                 }
                 if (!isTunnelPaused) {
-                    val stats = TunnelManager.stats.value
-                    updateNotification(stats)
+                    updateNotification(buildTunnelNotificationText())
                 }
                 delay(2000)
             }
         }
     }
 
+    private fun buildTunnelNotificationText(): String {
+        val statsText = TunnelManager.stats.value.trim()
+        return when {
+            statsText.isEmpty() -> "Туннель активен"
+            statsText == "Ожидание данных..." -> "Туннель активен"
+            else -> statsText
+        }
+    }
+
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
-            "wdtt_tunnel_v3",
+            TUNNEL_NOTIFICATION_CHANNEL_ID,
             "WDTT Туннель",
-            NotificationManager.IMPORTANCE_DEFAULT // Возвращаем DEFAULT, чтобы было на локскрине
+            NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "Уведомление о работе туннеля"
             setShowBadge(false)
@@ -314,26 +327,41 @@ class TunnelService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        return NotificationCompat.Builder(this, "wdtt_tunnel_v3")
+        return NotificationCompat.Builder(this, TUNNEL_NOTIFICATION_CHANNEL_ID)
             .setContentTitle("WDTT")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat_connected)
             .setOngoing(true)
+            .setLocalOnly(true)
             .setContentIntent(openIntent)
             .addAction(R.drawable.ic_stop, actionTitle, stopIntent)
-            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_DEFAULT)
             // ВАЖНО: Делаем уведомление публичным (видимым на локскрине)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             // Категория SERVICE помогает системе понять важность
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .setOnlyAlertOnce(true) // Не издавать звук и не будить экран при обновлении статистики!
             .setSilent(true) // Делаем тихим само уведомление
+            .setShowWhen(false)
+            .setUsesChronometer(false)
+            .setWhen(0L)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
+    private fun startPersistentForeground(notification: Notification) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(TUNNEL_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(TUNNEL_NOTIFICATION_ID, notification)
+        }
+    }
+
     private fun updateNotification(text: String) {
+        if (lastNotificationText == text) return
+        lastNotificationText = text
         val notification = createNotification(text)
-        getSystemService(NotificationManager::class.java).notify(1, notification)
+        getSystemService(NotificationManager::class.java).notify(TUNNEL_NOTIFICATION_ID, notification)
     }
 
     override fun onDestroy() {
